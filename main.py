@@ -329,7 +329,199 @@ def collector(symbol):
 
 # ================= Web =================
 
-HTML = """ ... 保留你原来的 HTML 不变 ... """
+HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Signal Engine</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { background:#020617; color:#e5e7eb; font-family:Arial; }
+    h1 { margin-bottom:4px; }
+    .grid { display:grid; grid-template-columns: 1fr 1fr; gap:20px; }
+    .card { background:#020617; padding:16px; border-radius:10px; border:1px solid #1e293b; }
+    .signal-strong { color:#ef4444; font-weight:bold; }
+    .signal-warn { color:#f59e0b; font-weight:bold; }
+    .signal-pullback { color:#38bdf8; font-weight:bold; }
+    table { width:100%; border-collapse:collapse; margin-top:8px; }
+    th,td { padding:6px; text-align:right; }
+    th { color:#94a3b8; }
+    td:first-child, th:first-child { text-align:left; }
+    select { background:#020617; color:#e5e7eb; border:1px solid #1e293b; padding:6px; border-radius:6px; }
+    .legend { font-size:12px; color:#94a3b8; margin-bottom:4px; }
+  </style>
+</head>
+<body>
+<h1>⚡ Trading Signal Engine</h1>
+
+<select id="symbolSelect"></select>
+<select id="rangeSelect">
+  <option value="3600">1h</option>
+  <option value="10800">3h</option>
+  <option value="21600">6h</option>
+  <option value="43200">12h</option>
+  <option value="86400" selected>24h</option>
+</select>
+
+<div class="grid">
+  <div class="card">
+    <div class="legend">Price (Avg + Exchanges)</div>
+    <canvas id="priceChart"></canvas>
+  </div>
+  <div class="card">
+    <div class="legend">Funding % (Avg + Exchanges)</div>
+    <canvas id="fundingChart"></canvas>
+  </div>
+  <div class="card">
+    <div class="legend">Open Interest (Avg + Exchanges)</div>
+    <canvas id="oiChart"></canvas>
+  </div>
+  <div class="card">
+    <h3>Signals</h3>
+    <table id="signalTable">
+      <thead>
+        <tr><th>Time</th><th>Level</th><th>Funding</th><th>OI Δ%</th><th>Price</th><th>VWAP</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const symbols = {{ symbols | safe }};
+let currentSymbol = symbols[0];
+let rangeSec = 86400;
+
+const COLORS = {
+  avg: "#ffffff",
+  binance: "#facc15",
+  bybit: "#38bdf8",
+  okx: "#a855f7",
+  bitget: "#22c55e",
+};
+
+function makeMultiChart(id, formatter=null) {
+  return new Chart(document.getElementById(id), {
+    type: "line",
+    data: { labels: [], datasets: [] },
+    options: {
+      responsive:true,
+      animation:false,
+      interaction:{mode:"nearest", intersect:false},
+      scales:{
+        x:{display:false},
+        y:{ ticks:{ callback: formatter || (v=>v) } }
+      },
+      plugins:{
+        legend:{ labels:{ color:"#cbd5f5" } }
+      }
+    }
+  });
+}
+
+const priceChart = makeMultiChart("priceChart");
+const fundingChart = makeMultiChart("fundingChart", v=>(v*100).toFixed(4)+"%");
+const oiChart = makeMultiChart("oiChart");
+
+function initSymbols() {
+  const sel = document.getElementById("symbolSelect");
+  symbols.forEach(s=>{
+    const opt = document.createElement("option");
+    opt.value = s;
+    opt.text = s;
+    sel.appendChild(opt);
+  });
+  sel.onchange = () => {
+    currentSymbol = sel.value;
+    refresh();
+  };
+
+  const rangeSel = document.getElementById("rangeSelect");
+  rangeSel.onchange = () => {
+    rangeSec = parseInt(rangeSel.value);
+    refresh();
+  };
+}
+
+function buildDatasets(chart, ts, avg, exMap, unitLabel, markers=[]) {
+  const datasets = [];
+
+  datasets.push({
+    label: unitLabel + " AVG",
+    data: avg,
+    borderColor: COLORS.avg,
+    borderWidth: 2.5,
+    tension:0.25,
+    pointRadius:0,
+  });
+
+  for (const ex in exMap) {
+    datasets.push({
+      label: unitLabel + " " + ex,
+      data: exMap[ex],
+      borderColor: COLORS[ex],
+      borderWidth: 1,
+      tension:0.25,
+      pointRadius:0,
+    });
+  }
+
+  if (markers.length) {
+    datasets.push({
+      type: "scatter",
+      label: "Short Entry",
+      data: markers,
+      pointRadius: 6,
+      pointBackgroundColor: "#ef4444",
+      showLine: false,
+    });
+  }
+
+  chart.data.labels = ts.map(t => t.slice(11,19));
+  chart.data.datasets = datasets;
+  chart.update();
+}
+
+async function refresh() {
+  const res = await fetch(`/api/state?symbol=${currentSymbol}&range=${rangeSec}`);
+  const data = await res.json();
+
+  const markers = (data.signals || []).map(s => ({
+    x: s.index,
+    y: s.price,
+  }));
+
+  buildDatasets(priceChart, data.ts, data.price_avg, data.price_ex, "Price", markers);
+  buildDatasets(fundingChart, data.ts, data.funding_avg, data.funding_ex, "Funding");
+  buildDatasets(oiChart, data.ts, data.oi_avg, data.oi_ex, "OI");
+
+  const tbody = document.querySelector("#signalTable tbody");
+  tbody.innerHTML = "";
+  (data.signals || []).slice().reverse().forEach(s => {
+    let cls = "";
+    if (s.level === "STRONG_SHORT") cls = "signal-strong";
+    if (s.level === "PREPARE_SHORT") cls = "signal-warn";
+    if (s.level === "PULLBACK_SHORT") cls = "signal-pullback";
+    tbody.innerHTML += `
+      <tr class="${cls}">
+        <td>${s.ts.slice(11,19)}</td>
+        <td>${s.level}</td>
+        <td>${(s.funding*100).toFixed(4)}%</td>
+        <td>${(s.oi_change*100).toFixed(2)}%</td>
+        <td>${s.price.toFixed(3)}</td>
+        <td>${s.vwap.toFixed(3)}</td>
+      </tr>`;
+  });
+}
+
+initSymbols();
+setInterval(refresh, 10000);
+refresh();
+</script>
+</body>
+</html>
+"""
+
 
 @app.route("/")
 def home():
