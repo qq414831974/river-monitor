@@ -21,7 +21,7 @@ SIGNAL_CONFIG = {
     "cooldown_sec": 900,
 }
 
-SYMBOLS = ["RIVERUSDT", "HYPEUSDT", "BTCUSDT", "ETHUSDT"]
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "RIVERUSDT", "HYPEUSDT"]
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
