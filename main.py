@@ -283,13 +283,6 @@ def collector(symbol):
     state = symbols_state[symbol]
 
     while True:
-        now = time.time()
-        # 有人访问，直接读取缓存，不刷新
-        if now - last_access_ts < ACCESS_TIMEOUT:
-            time.sleep(5)
-            continue
-
-        # 无人访问，刷新数据
         try:
             snapshot_ts = datetime.now(timezone(timedelta(hours=8))).isoformat()
             snapshot = {}
