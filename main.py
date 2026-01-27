@@ -438,7 +438,10 @@ function initSymbols() {
 
 function buildDatasets(chart, ts, avg, exMap, unitLabel, markers=[]) {
   const datasets = [];
-
+  avg = avg || [];
+  exMap = exMap || {};
+  markers = markers || [];
+  
   datasets.push({
     label: unitLabel + " AVG",
     data: avg,
@@ -538,7 +541,13 @@ def slice_deque(dq, n):
 
 def serialize_state(state, range_sec):
     points = int(range_sec / REFRESH_INTERVAL)
+
+    # 如果 state 还没初始化，返回空列表
+    def safe_slice(dq):
+        return list(dq)[-points:] if dq else []
+
     return {
+        "ts": safe_slice(state.get("ts")),
         "price_avg": slice_deque(state["price_avg"], points),
         "funding_avg": slice_deque(state["funding_avg"], points),
         "oi_avg": slice_deque(state["oi_avg"], points),
