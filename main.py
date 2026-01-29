@@ -162,13 +162,14 @@ def compute_signal_on_series(state):
     prices = list(state["price_avg"])
     fundings = list(state["funding_avg"])
     ois = list(state["oi_avg"])
-    if len(prices) < 60:
+
+    window = int(1800 / REFRESH_INTERVAL)
+    if len(prices) < window or len(ois) < window:
         return None
 
     funding_now = fundings[-1]
     price_now = prices[-1]
     oi_now = ois[-1]
-    window = int(1800 / REFRESH_INTERVAL)
 
     funding_strong = funding_now <= SIGNAL_CONFIG["funding_strong"]
     funding_warn = funding_now <= SIGNAL_CONFIG["funding_warn"]
@@ -215,15 +216,15 @@ def compute_pullback_on_series(state):
     prices = list(state["price_avg"])
     fundings = list(state["funding_avg"])
     ois = list(state["oi_avg"])
-    if len(prices) < 120:
+
+    long_window = int(1800 / REFRESH_INTERVAL)
+    short_window = int(600 / REFRESH_INTERVAL)
+    if len(prices) < long_window or len(prices) < short_window or len(ois) < short_window:
         return None
 
     price_now = prices[-1]
     funding_now = fundings[-1]
     oi_now = ois[-1]
-
-    long_window = int(1800 / REFRESH_INTERVAL)
-    short_window = int(600 / REFRESH_INTERVAL)
 
     vwap_30 = mean(prices[-long_window:])
     trend_down = price_now < vwap_30
