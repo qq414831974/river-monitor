@@ -3,7 +3,7 @@ import time
 import threading
 import json
 import os
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from collections import deque
 from flask import Flask, jsonify, render_template_string, request
 
@@ -14,14 +14,15 @@ MAX_HOURS = 24
 MAX_POINTS = int(3600 / REFRESH_INTERVAL * MAX_HOURS)
 
 SIGNAL_CONFIG = {
-    "funding_strong": -0.02,
+    "funding_strong": -0.018,
     "funding_warn": -0.012,
     "oi_drop_pct": -0.06,        # 30 min
-    "price_break_pct": -0.01,    # below VWAP
-    "cooldown_sec": 900,
+    "price_break_pct": -0.008,  # below VWAP
+    "pullback_reject_pct": 0.004,
+    "cooldown_sec": 1200,
 }
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "RIVERUSDT", "HYPEUSDT"]
+SYMBOLS = ["RIVERUSDT", "HYPEUSDT", "BTCUSDT", "ETHUSDT"]
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -30,19 +31,16 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 app = Flask(__name__)
 symbols_state = {}
-last_access_ts = time.time()
 
 # ================= Persistence =================
 
 def log_file(symbol):
     return os.path.join(DATA_DIR, f"{symbol}.jsonl")
 
-def slice_deque(dq, n):
-    return list(dq)[-n:] if dq else []
 
 def load_history(symbol):
-    # 初始化 state
     state = {
+        "ts": deque(maxlen=MAX_POINTS),
         "price_avg": deque(maxlen=MAX_POINTS),
         "funding_avg": deque(maxlen=MAX_POINTS),
         "oi_avg": deque(maxlen=MAX_POINTS),
@@ -51,9 +49,8 @@ def load_history(symbol):
         "funding_ex": {ex: deque(maxlen=MAX_POINTS) for ex in EXCHANGE_FUNCS},
         "oi_ex": {ex: deque(maxlen=MAX_POINTS) for ex in EXCHANGE_FUNCS},
 
-        "signals": deque(maxlen=500),
+        "signals": deque(maxlen=300),
         "last_signal_ts": 0,
-        "ts": deque(maxlen=MAX_POINTS),
     }
 
     path = log_file(symbol)
@@ -62,43 +59,43 @@ def load_history(symbol):
 
     try:
         with open(path) as f:
-            rows = [json.loads(l) for l in f if l.strip()]
-    except:
-        return state
+            for line in f:
+                row = json.loads(line)
+                snap = row["data"]
+                ts = row.get("ts")
 
-    for row in rows:
-        snap = row["data"]
-        ts = row.get("ts")
-        prices, fundings, ois = [], [], []
+                prices = []
+                fundings = []
+                ois = []
 
-        for ex, v in snap.items():
-            prices.append(v["price"])
-            fundings.append(v["funding"])
-            ois.append(v["oi"])
+                for ex, v in snap.items():
+                    prices.append(v["price"])
+                    fundings.append(v["funding"])
+                    ois.append(v["oi"])
 
-            state["price_ex"][ex].append(v["price"])
-            state["funding_ex"][ex].append(v["funding"])
-            state["oi_ex"][ex].append(v["oi"])
+                    state["price_ex"][ex].append(v["price"])
+                    state["funding_ex"][ex].append(v["funding"])
+                    state["oi_ex"][ex].append(v["oi"])
 
-        state["price_avg"].append(mean(prices))
-        state["funding_avg"].append(mean(fundings))
-        state["oi_avg"].append(mean(ois))
-        state["ts"].append(ts)
-
-        sig = compute_signal_on_series(state)
-        if sig:
-            state["signals"].append(sig)
+                state["ts"].append(ts)
+                state["price_avg"].append(mean(prices))
+                state["funding_avg"].append(mean(fundings))
+                state["oi_avg"].append(mean(ois))
+    except Exception as e:
+        print("load history error:", e)
 
     return state
 
-def persist(symbol, snapshot, ts):
+
+def persist(symbol, snapshot):
     record = {
-        "ts": ts,
+        "ts": datetime.utcnow().isoformat(),
         "symbol": symbol,
         "data": snapshot,
     }
     with open(log_file(symbol), "a") as f:
         f.write(json.dumps(record) + "\n")
+
 
 # ================= Utils =================
 
@@ -107,11 +104,14 @@ def get_json(url):
     r.raise_for_status()
     return r.json()
 
+
 def now_ts():
     return int(time.time())
 
+
 def mean(xs):
     return sum(xs) / len(xs) if xs else 0
+
 
 # ================= Exchange APIs =================
 
@@ -124,6 +124,7 @@ def binance_data(symbol):
         "oi": float(oi["openInterest"]),
     }
 
+
 def bybit_data(symbol):
     r = get_json(f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={symbol}")
     item = r["result"]["list"][0]
@@ -132,6 +133,7 @@ def bybit_data(symbol):
         "price": float(item["markPrice"]),
         "oi": float(item["openInterest"]),
     }
+
 
 def okx_data(symbol):
     inst = symbol.replace("USDT", "-USDT-SWAP")
@@ -144,14 +146,19 @@ def okx_data(symbol):
         "price": float(p["data"][0]["last"]),
     }
 
+
 def bitget_data(symbol):
-    r = get_json(f"https://api.bitget.com/api/v2/mix/market/ticker?symbol={symbol}&productType=USDT-FUTURES")
+    r = get_json(
+        f"https://api.bitget.com/api/v2/mix/market/ticker"
+        f"?symbol={symbol}&productType=USDT-FUTURES"
+    )
     item = r["data"][0]
     return {
         "funding": float(item["fundingRate"]),
         "price": float(item["markPrice"]),
         "oi": float(item["holdingAmount"]),
     }
+
 
 EXCHANGE_FUNCS = {
     "binance": binance_data,
@@ -162,125 +169,83 @@ EXCHANGE_FUNCS = {
 
 # ================= Signal Engine =================
 
-def compute_signal_on_series(state):
+def compute_signal(state):
+    if len(state["price_avg"]) < 60:
+        return None
+
     prices = list(state["price_avg"])
     fundings = list(state["funding_avg"])
     ois = list(state["oi_avg"])
-    if len(prices) < 60:
-        return None
+    ts_list = list(state["ts"])
 
     funding_now = fundings[-1]
     price_now = prices[-1]
     oi_now = ois[-1]
-    window = int(1800 / REFRESH_INTERVAL)
+    ts_now = ts_list[-1]
 
-    funding_strong = funding_now <= SIGNAL_CONFIG["funding_strong"]
     funding_warn = funding_now <= SIGNAL_CONFIG["funding_warn"]
-    funding_long_strong = funding_now >= -SIGNAL_CONFIG["funding_strong"]
-    funding_long_warn = funding_now >= -SIGNAL_CONFIG["funding_warn"]
+    funding_strong = funding_now <= SIGNAL_CONFIG["funding_strong"]
 
+    window = int(1800 / REFRESH_INTERVAL)
     if len(ois) > window:
         oi_prev = ois[-window]
         oi_change = (oi_now - oi_prev) / oi_prev if oi_prev else 0
     else:
-        return None
+        oi_change = 0
 
     oi_break = oi_change <= SIGNAL_CONFIG["oi_drop_pct"]
-    oi_rise = oi_change >= -SIGNAL_CONFIG["oi_drop_pct"]
 
     vwap = mean(prices[-window:])
     price_break = (price_now - vwap) / vwap <= SIGNAL_CONFIG["price_break_pct"]
-    price_rise = (price_now - vwap) / vwap >= -SIGNAL_CONFIG["price_break_pct"]
+
+    # ---- Pullback Short ----
+    pullback_short = False
+    if len(prices) >= window * 2:
+        prev_leg_low = min(prices[-window*2:-window])
+        rebound = (price_now - prev_leg_low) / prev_leg_low
+        reject = (price_now - vwap) / vwap <= SIGNAL_CONFIG["pullback_reject_pct"]
+        pullback_short = rebound > 0.01 and reject and funding_warn and oi_break
+
+    # ---- Pullback Long ----
+    pullback_long = False
+    if len(prices) >= window * 2:
+        prev_leg_high = max(prices[-window*2:-window])
+        pullback = (price_now - prev_leg_high) / prev_leg_high
+        support = (price_now - vwap) / vwap >= -SIGNAL_CONFIG["pullback_reject_pct"]
+        pullback_long = pullback < -0.01 and support and funding_now >= 0.01 and oi_change >= 0.04
 
     now = now_ts()
     if now - state["last_signal_ts"] < SIGNAL_CONFIG["cooldown_sec"]:
         return None
 
-    # 做空
+    level = None
+    side = None
+
     if funding_strong and oi_break and price_break:
         level = "STRONG_SHORT"
-    elif funding_warn and oi_break:
-        level = "PREPARE_SHORT"
-    # 做多
-    elif funding_long_strong and oi_rise and price_rise:
-        level = "STRONG_LONG"
-    elif funding_long_warn and oi_rise:
-        level = "PREPARE_LONG"
-    else:
+        side = "SHORT"
+    elif pullback_short:
+        level = "PULLBACK_SHORT"
+        side = "SHORT"
+    elif pullback_long:
+        level = "PULLBACK_LONG"
+        side = "LONG"
+
+    if not level:
         return None
 
     state["last_signal_ts"] = now
-    idx = len(prices) - 1
+
     return {
-        "ts": state["ts"][idx],
+        "ts": ts_now,
         "level": level,
-        "price": price_now,
+        "side": side,
         "funding": funding_now,
         "oi_change": oi_change,
+        "price": price_now,
         "vwap": vwap,
-        "index": idx,
     }
 
-def compute_pullback_on_series(state):
-    prices = list(state["price_avg"])
-    fundings = list(state["funding_avg"])
-    ois = list(state["oi_avg"])
-    if len(prices) < 120:
-        return None
-
-    price_now = prices[-1]
-    funding_now = fundings[-1]
-    oi_now = ois[-1]
-
-    long_window = int(1800 / REFRESH_INTERVAL)
-    short_window = int(600 / REFRESH_INTERVAL)
-
-    vwap_30 = mean(prices[-long_window:])
-    trend_down = price_now < vwap_30
-    trend_up = price_now > vwap_30
-
-    rebound = (prices[-1] - prices[-short_window]) / prices[-short_window] >= 0.008
-    near_vwap = abs(price_now - vwap_30) / vwap_30 <= 0.003
-
-    funding_rebound = fundings[-short_window] < funding_now < 0
-    oi_change = (oi_now - ois[-short_window]) / ois[-short_window]
-    oi_hold = oi_change >= -0.01
-
-    now = now_ts()
-    if now - state["last_signal_ts"] < SIGNAL_CONFIG["cooldown_sec"]:
-        return None
-
-    # 做空回调
-    if trend_down and rebound and near_vwap and funding_rebound and oi_hold:
-        state["last_signal_ts"] = now
-        idx = len(prices) - 1
-        return {
-            "ts": state["ts"][idx],
-            "level": "PULLBACK_SHORT",
-            "price": price_now,
-            "funding": funding_now,
-            "oi_change": oi_change,
-            "vwap": vwap_30,
-            "index": idx,
-        }
-    # 做多回调
-    if trend_up and rebound and near_vwap and funding_rebound and oi_hold:
-        state["last_signal_ts"] = now
-        idx = len(prices) - 1
-        return {
-            "ts": state["ts"][idx],
-            "level": "PULLBACK_LONG",
-            "price": price_now,
-            "funding": funding_now,
-            "oi_change": oi_change,
-            "vwap": vwap_30,
-            "index": idx,
-        }
-
-def compute_realtime_signal(state):
-    sig1 = compute_signal_on_series(state)
-    sig2 = compute_pullback_on_series(state)
-    return sig2 or sig1
 
 # ================= Collector =================
 
@@ -290,7 +255,6 @@ def collector(symbol):
 
     while True:
         try:
-            snapshot_ts = datetime.now(timezone(timedelta(hours=8))).isoformat()
             snapshot = {}
             for name, fn in EXCHANGE_FUNCS.items():
                 try:
@@ -299,7 +263,10 @@ def collector(symbol):
                     print(f"⚠️ {symbol} {name} failed:", e)
 
             if snapshot:
-                prices, fundings, ois = [], [], []
+                prices = []
+                fundings = []
+                ois = []
+
                 for ex, v in snapshot.items():
                     prices.append(v["price"])
                     fundings.append(v["funding"])
@@ -309,14 +276,15 @@ def collector(symbol):
                     state["funding_ex"][ex].append(v["funding"])
                     state["oi_ex"][ex].append(v["oi"])
 
+                ts_now = datetime.utcnow().isoformat()
+                state["ts"].append(ts_now)
                 state["price_avg"].append(mean(prices))
                 state["funding_avg"].append(mean(fundings))
                 state["oi_avg"].append(mean(ois))
-                state["ts"].append(snapshot_ts)
 
-                persist(symbol, snapshot, snapshot_ts)
+                persist(symbol, snapshot)
 
-                sig = compute_realtime_signal(state)
+                sig = compute_signal(state)
                 if sig:
                     state["signals"].append(sig)
                     print("🚨 SIGNAL:", symbol, sig)
@@ -324,7 +292,8 @@ def collector(symbol):
         except Exception as e:
             print(f"collector {symbol} error:", e)
 
-        time.sleep(60)
+        time.sleep(REFRESH_INTERVAL)
+
 
 # ================= Web =================
 
@@ -332,39 +301,38 @@ HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Signal Engine</title>
+  <title>Trading Signal Engine</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
     body { background:#020617; color:#e5e7eb; font-family:Arial; }
     h1 { margin-bottom:4px; }
     .grid { display:grid; grid-template-columns: 1fr 1fr; gap:20px; }
     .card { background:#020617; padding:16px; border-radius:10px; border:1px solid #1e293b; }
-    .signal-strong { color:#ef4444; font-weight:bold; }       /* STRONG_SHORT */
-    .signal-warn { color:#f59e0b; font-weight:bold; }         /* PREPARE_SHORT */
-    .signal-pullback { color:#38bdf8; font-weight:bold; }     /* PULLBACK_SHORT */
-    .signal-strong-long { color:#22c55e; font-weight:bold; }  /* STRONG_LONG */
-    .signal-warn-long { color:#10b981; font-weight:bold; }    /* PREPARE_LONG */
-    .signal-pullback-long { color:#3b82f6; font-weight:bold; }/* PULLBACK_LONG */
+    .signal-strong { color:#ef4444; font-weight:bold; }
+    .signal-warn { color:#f59e0b; font-weight:bold; }
+    .signal-long { color:#22c55e; font-weight:bold; }
     table { width:100%; border-collapse:collapse; margin-top:8px; }
     th,td { padding:6px; text-align:right; }
     th { color:#94a3b8; }
     td:first-child, th:first-child { text-align:left; }
     select { background:#020617; color:#e5e7eb; border:1px solid #1e293b; padding:6px; border-radius:6px; }
     .legend { font-size:12px; color:#94a3b8; margin-bottom:4px; }
+    .toolbar { display:flex; gap:12px; margin-bottom:10px; }
   </style>
 </head>
 <body>
-<h1>⚡ Trading Signal Engine</h1>
+<h1>⚡ Signal Engine</h1>
 
-<select id="symbolSelect"></select>
-<select id="rangeSelect">
-  <option value="900" selected>15m</option>
-  <option value="3600">1h</option>
-  <option value="10800">3h</option>
-  <option value="21600">6h</option>
-  <option value="43200">12h</option>
-  <option value="86400">24h</option>
-</select>
+<div class="toolbar">
+  <select id="symbolSelect"></select>
+  <select id="rangeSelect">
+    <option value="1">1h</option>
+    <option value="3">3h</option>
+    <option value="6">6h</option>
+    <option value="12">12h</option>
+    <option value="24" selected>24h</option>
+  </select>
+</div>
 
 <div class="grid">
   <div class="card">
@@ -383,7 +351,7 @@ HTML = """
     <h3>Signals</h3>
     <table id="signalTable">
       <thead>
-        <tr><th>Time</th><th>Level</th><th>Funding</th><th>OI Δ%</th><th>Price</th><th>VWAP</th></tr>
+        <tr><th>Time</th><th>Level</th><th>Side</th><th>Funding</th><th>OI Δ%</th><th>Price</th><th>VWAP</th></tr>
       </thead>
       <tbody></tbody>
     </table>
@@ -393,7 +361,7 @@ HTML = """
 <script>
 const symbols = {{ symbols | safe }};
 let currentSymbol = symbols[0];
-let rangeSec = 86400;
+let currentHours = 24;
 
 const COLORS = {
   avg: "#ffffff",
@@ -426,7 +394,7 @@ const priceChart = makeMultiChart("priceChart");
 const fundingChart = makeMultiChart("fundingChart", v=>(v*100).toFixed(4)+"%");
 const oiChart = makeMultiChart("oiChart");
 
-function initSymbols() {
+function initControls() {
   const sel = document.getElementById("symbolSelect");
   symbols.forEach(s=>{
     const opt = document.createElement("option");
@@ -441,17 +409,14 @@ function initSymbols() {
 
   const rangeSel = document.getElementById("rangeSelect");
   rangeSel.onchange = () => {
-    rangeSec = parseInt(rangeSel.value);
+    currentHours = parseInt(rangeSel.value);
     refresh();
   };
 }
 
-function buildDatasets(chart, ts, avg, exMap, unitLabel, markers=[]) {
+function buildDatasets(chart, ts, avg, exMap, unitLabel) {
   const datasets = [];
-  avg = avg || [];
-  exMap = exMap || {};
-  markers = markers || [];
-  
+
   datasets.push({
     label: unitLabel + " AVG",
     data: avg,
@@ -472,57 +437,60 @@ function buildDatasets(chart, ts, avg, exMap, unitLabel, markers=[]) {
     });
   }
 
-  if (markers.length) {
-    datasets.push({
-      type: "scatter",
-      label: "Signal",
-      data: markers,
-      pointRadius: 6,
-      pointBackgroundColor: markers.map(m => {
-        if(m.level.includes("SHORT")) return "#ef4444";
-        if(m.level.includes("PREPARE_SHORT")) return "#f59e0b";
-        if(m.level.includes("PULLBACK_SHORT")) return "#38bdf8";
-        if(m.level.includes("LONG")) return "#22c55e";
-        return "#ffffff";
-      }),
-      showLine: false,
-    });
-  }
-
-  chart.data.labels = ts.map(t => t.slice(11,19));
+  chart.data.labels = ts.map(t=>t.slice(11,19));
   chart.data.datasets = datasets;
   chart.update();
 }
 
+function overlaySignals(chart, ts, prices, signals) {
+  if (!signals || signals.length === 0) return;
+
+  const sigDataset = {
+    label: "Signals",
+    data: [],
+    showLine: false,
+    pointRadius: 6,
+    pointHoverRadius: 8,
+    pointBackgroundColor: [],
+    pointBorderColor: [],
+  };
+
+  signals.forEach(sig => {
+    const idx = ts.findIndex(t => t >= sig.ts);
+    if (idx === -1) return;
+
+    sigDataset.data.push({ x: idx, y: prices[idx] });
+    if (sig.side === "SHORT") {
+      sigDataset.pointBackgroundColor.push("#ef4444");
+      sigDataset.pointBorderColor.push("#ef4444");
+    } else {
+      sigDataset.pointBackgroundColor.push("#22c55e");
+      sigDataset.pointBorderColor.push("#22c55e");
+    }
+  });
+
+  chart.data.datasets.push(sigDataset);
+}
+
 async function refresh() {
-  const res = await fetch(`/api/state?symbol=${currentSymbol}&range=${rangeSec}`);
+  const res = await fetch(`/api/state?symbol=${currentSymbol}&hours=${currentHours}`);
   const data = await res.json();
-  const signals = data.signals || [];
 
-  const markers = signals.map(s => ({
-    x: s.index,
-    y: s.price,
-    level: s.level
-  }));
-
-  buildDatasets(priceChart, data.ts, data.price_avg, data.price_ex, "Price", markers);
+  buildDatasets(priceChart, data.ts, data.price_avg, data.price_ex, "Price");
   buildDatasets(fundingChart, data.ts, data.funding_avg, data.funding_ex, "Funding");
   buildDatasets(oiChart, data.ts, data.oi_avg, data.oi_ex, "OI");
 
+  overlaySignals(priceChart, data.ts, data.price_avg, data.signals);
+
   const tbody = document.querySelector("#signalTable tbody");
   tbody.innerHTML = "";
-  signals.slice().reverse().forEach(s => {
-    let cls = "";
-    if (s.level === "STRONG_SHORT") cls = "signal-strong";
-    if (s.level === "PREPARE_SHORT") cls = "signal-warn";
-    if (s.level === "PULLBACK_SHORT") cls = "signal-pullback";
-    if (s.level === "STRONG_LONG") cls = "signal-strong-long";
-    if (s.level === "PREPARE_LONG") cls = "signal-warn-long";
-    if (s.level === "PULLBACK_LONG") cls = "signal-pullback-long";
+  (data.signals || []).slice().reverse().forEach(s => {
+    const cls = s.side === "SHORT" ? "signal-strong" : "signal-long";
     tbody.innerHTML += `
       <tr class="${cls}">
         <td>${s.ts.slice(11,19)}</td>
         <td>${s.level}</td>
+        <td>${s.side}</td>
         <td>${(s.funding*100).toFixed(4)}%</td>
         <td>${(s.oi_change*100).toFixed(2)}%</td>
         <td>${s.price.toFixed(3)}</td>
@@ -531,7 +499,7 @@ async function refresh() {
   });
 }
 
-initSymbols();
+initControls();
 setInterval(refresh, 10000);
 refresh();
 </script>
@@ -539,38 +507,51 @@ refresh();
 </html>
 """
 
+
 @app.route("/")
 def home():
-    global last_access_ts
-    last_access_ts = time.time()
     return render_template_string(HTML, symbols=SYMBOLS)
+
+
+def serialize_state(state, hours):
+    points = int(hours * 3600 / REFRESH_INTERVAL)
+
+    ts = list(state["ts"])[-points:]
+    price_avg = list(state["price_avg"])[-points:]
+    funding_avg = list(state["funding_avg"])[-points:]
+    oi_avg = list(state["oi_avg"])[-points:]
+
+    price_ex = {k: list(v)[-points:] for k, v in state["price_ex"].items()}
+    funding_ex = {k: list(v)[-points:] for k, v in state["funding_ex"].items()}
+    oi_ex = {k: list(v)[-points:] for k, v in state["oi_ex"].items()}
+
+    signals = [s for s in state["signals"] if s["ts"] >= ts[0]] if ts else []
+
+    return {
+        "ts": ts,
+        "price_avg": price_avg,
+        "funding_avg": funding_avg,
+        "oi_avg": oi_avg,
+        "price_ex": price_ex,
+        "funding_ex": funding_ex,
+        "oi_ex": oi_ex,
+        "signals": signals,
+    }
+
 
 @app.route("/api/state")
 def api_state():
-    global last_access_ts
-    last_access_ts = time.time()
     symbol = request.args.get("symbol", SYMBOLS[0])
-    range_sec = int(request.args.get("range", 86400))
-    state = symbols_state.get(symbol)
-    if not state:
-        return jsonify({})
-    points = int(range_sec / REFRESH_INTERVAL)
-    return jsonify({
-        "ts": slice_deque(state["ts"], points),
-        "price_avg": slice_deque(state["price_avg"], points),
-        "funding_avg": slice_deque(state["funding_avg"], points),
-        "oi_avg": slice_deque(state["oi_avg"], points),
-        "price_ex": {k: slice_deque(v, points) for k, v in state["price_ex"].items()},
-        "funding_ex": {k: slice_deque(v, points) for k, v in state["funding_ex"].items()},
-        "oi_ex": {k: slice_deque(v, points) for k, v in state["oi_ex"].items()},
-        "signals": list(state["signals"]),
-    })
+    hours = float(request.args.get("hours", 24))
+    return jsonify(serialize_state(symbols_state[symbol], hours))
+
 
 # ================= Bootstrap =================
 
 def start_symbol(symbol):
     symbols_state[symbol] = load_history(symbol)
     threading.Thread(target=collector, args=(symbol,), daemon=True).start()
+
 
 if __name__ == "__main__":
     for sym in SYMBOLS:
