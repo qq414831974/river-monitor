@@ -326,11 +326,12 @@ HTML = """
 <div class="toolbar">
   <select id="symbolSelect"></select>
   <select id="rangeSelect">
-    <option value="1">1h</option>
+    <option value="1" selected>1h</option>
     <option value="3">3h</option>
     <option value="6">6h</option>
     <option value="12">12h</option>
-    <option value="24" selected>24h</option>
+    <option value="24">24h</option>
+    <option value="168">7d</option>
   </select>
 </div>
 
